@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Output / build artifacts
+output/
+
+# Log files
+*.log
+
+# Desktop app persistent state
+.intune_desktop_app/
+
+# IntuneWinAppUtil binary (not redistributable)
+IntuneWinAppUtil.exe
+
+# IDE / editor
+.vscode/
+*.swp
+*.swo
+*~

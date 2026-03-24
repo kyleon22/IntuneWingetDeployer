@@ -1,0 +1,11 @@
+{
+  "Google.Chrome": {
+    "DisplayName": "Google Chrome Enterprise",
+    "Publisher": "Google",
+    "Description": "Managed browser deployment",
+    "SilentCommand": "/silent /install",
+    "UninstallCommand": "\"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe\" --uninstall --force-uninstall",
+    "DetectionScript": "$paths = @('HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*','HKLM:\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*')\n$apps = foreach ($path in $paths) { Get-ItemProperty -Path $path -ErrorAction SilentlyContinue }\nif ($apps | Where-Object { $_.DisplayName -like '*Google Chrome*' }) { exit 0 }\nexit 1",
+    "RequirementScript": "$paths = @('HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*','HKLM:\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*')\n$apps = foreach ($path in $paths) { Get-ItemProperty -Path $path -ErrorAction SilentlyContinue }\nif ($apps | Where-Object { $_.DisplayName -like '*Google Chrome*' }) { exit 0 }\nexit 1"
+  }
+}

@@ -1,0 +1,13 @@
+﻿Portable bundle created for Intune Winget Deployer.
+
+Before use on another machine, make sure you have:
+- Python 3.x
+- winget
+- IntuneWinAppUtil.exe
+- required PowerShell modules
+- appropriate Entra / Intune permissions
+
+Recommended first steps:
+1. Copy IntuneWinAppUtil.exe into this folder or update the path in the app.
+2. Run Launch-IntuneDesktopApp.cmd
+3. Pin Intune module version to 1.4.3 in the UI if needed.
