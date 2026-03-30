@@ -16,12 +16,13 @@ This app gives you:
 - editable app metadata before publish, with sensible autofill defaults from the selected package
 - optional IntuneWin32App module version pinning (defaulting to 1.4.3 in the app UI)
 - assignment controls in the app
-- saved profiles for tenant/client/module/tool defaults in multi-tenant environments
+- delegated auth with browser sign-in (no app registration needed) or device code fallback
+- saved profiles for tenant/module/tool defaults in multi-tenant environments
 - deployment history from prior package/publish runs
 - bulk deployment from JSON config files
 - a built-in override editor for JSON-based app overrides
 - optional supersedence fields for update deployments
-- pre-run validation for required auth fields like Intune Client ID
+- pre-run validation for required auth fields
 - a cleaner progress / stage status strip
 - the ability to publish an existing package without rebuilding it
 
@@ -57,7 +58,8 @@ Use this to:
 ### Publish
 Use this to:
 - choose an existing `metadata.json`
-- authenticate
+- authenticate via browser sign-in (default) or device code
+- optionally use legacy app registration auth
 - pin the IntuneWin32App module version if needed
 - optionally configure supersedence for update deployments
 - upload to Intune
