@@ -25,9 +25,16 @@ class ProcessRunner:
         self.process = None
         self.thread = None
 
-    def run(self, args, cwd):
+    def run(self, args, cwd, extra_env=None):
         if self.process and self.process.poll() is None:
             raise RuntimeError("A process is already running.")
+
+        import os
+        child_env = os.environ.copy()
+        child_env["DOTNET_EnableDiagnostics"] = "0"
+        child_env["COMPlus_EnableDiagnostics"] = "0"
+        if extra_env:
+            child_env.update(extra_env)
 
         def target():
             rc = -1
@@ -35,6 +42,7 @@ class ProcessRunner:
                 self.process = subprocess.Popen(
                     args,
                     cwd=str(cwd),
+                    env=child_env,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     text=True,
@@ -231,7 +239,7 @@ class IntuneDesktopApp(tk.Tk):
         self.pub_metadata = self.current_metadata_path
         self.pub_assignment = tk.StringVar(value="all")
         self.pub_group = tk.StringVar()
-        self.pub_auth_mode = tk.StringVar(value="IntuneGraph")
+        self.pub_auth_mode = tk.StringVar(value="Delegated")
         self.pub_client_id = tk.StringVar()
         self.pub_module_version = tk.StringVar(value="1.4.3")
         self.pub_device_code = tk.BooleanVar(value=False)
@@ -251,8 +259,8 @@ class IntuneDesktopApp(tk.Tk):
         self._labeled_entry(frm, "Target group", self.pub_group, 3)
 
         ttk.Label(frm, text="Auth mode").grid(row=4, column=0, sticky="w", pady=6)
-        ttk.Combobox(frm, textvariable=self.pub_auth_mode, values=["IntuneGraph", "MgGraph"], state="readonly").grid(row=4, column=1, sticky="w", pady=6)
-        self._labeled_entry(frm, "Intune Client ID", self.pub_client_id, 5)
+        ttk.Combobox(frm, textvariable=self.pub_auth_mode, values=["Delegated", "AppRegistration"], state="readonly").grid(row=4, column=1, sticky="w", pady=6)
+        self._labeled_entry(frm, "Client ID (optional)", self.pub_client_id, 5)
         self._labeled_entry(frm, "Intune module version", self.pub_module_version, 6)
         self._labeled_entry(frm, "Override config", self.pub_override, 7, browse=lambda: self._pick_file(self.pub_override, [("JSON", "*.json"), ("All files", "*.*")]))
         self._labeled_entry(frm, "Custom display name", self.pub_display_name, 8)
@@ -305,7 +313,7 @@ class IntuneDesktopApp(tk.Tk):
         self._labeled_entry(frm, "Target group", self.run_group, 5)
         self._labeled_entry(frm, "Intune prep tool", self.run_prep_tool, 6, browse=lambda: self._pick_file(self.run_prep_tool, [("Executable", "*.exe"), ("All files", "*.*")]))
         self._labeled_entry(frm, "Local installer", self.run_local_installer, 7, browse=lambda: self._pick_file(self.run_local_installer, [("Installer", "*.exe *.msi"), ("All files", "*.*")]))
-        self._labeled_entry(frm, "Intune Client ID", self.run_client_id, 8)
+        self._labeled_entry(frm, "Client ID (optional)", self.run_client_id, 8)
         self._labeled_entry(frm, "Intune module version", self.run_module_version, 9)
 
         run_picker = ttk.LabelFrame(frm, text="Winget package selection", padding=8)
@@ -675,7 +683,7 @@ class IntuneDesktopApp(tk.Tk):
             return
         answer = messagebox.askyesno(
             "First run setup",
-            "No saved app registration/bootstrap state was found yet.\n\nWould you like to open the Setup flow now and bootstrap dependencies + app registration?"
+            "No saved setup state was found yet.\n\nWould you like to run the prerequisites check now?\n\n(Delegated auth is used by default; app registration is optional.)"
         )
         if answer:
             self.run_preflight_check()
@@ -780,6 +788,7 @@ class IntuneDesktopApp(tk.Tk):
         profiles = self._read_profiles()
         profiles[name] = {
             "tenantId": self.pub_tenant.get(),
+            "authMode": self.pub_auth_mode.get(),
             "clientId": self.pub_client_id.get(),
             "moduleVersion": self.pub_module_version.get(),
             "prepTool": self.pkg_prep_tool.get(),
@@ -802,6 +811,7 @@ class IntuneDesktopApp(tk.Tk):
             return
         self.pub_tenant.set(profile.get("tenantId", self.pub_tenant.get()))
         self.run_tenant.set(profile.get("tenantId", self.run_tenant.get()))
+        self.pub_auth_mode.set(profile.get("authMode", self.pub_auth_mode.get()))
         self.pub_client_id.set(profile.get("clientId", self.pub_client_id.get()))
         self.run_client_id.set(profile.get("clientId", self.run_client_id.get()))
         self.pub_module_version.set(profile.get("moduleVersion", self.pub_module_version.get()))
@@ -949,7 +959,241 @@ class IntuneDesktopApp(tk.Tk):
             self.progress_var.set(100)
             self.stage_var.set("Done")
 
-    def _run_command(self, script_name, params):
+    def _ensure_graph_auth(self, tenant_id, use_device_code=False):
+        """Pre-authenticate to Microsoft Graph using raw OAuth2 flows.
+
+        Bypasses the Microsoft Graph PowerShell SDK entirely to avoid
+        .NET EventSource crashes on PowerShell 5.1. Uses direct REST calls
+        to Azure AD token endpoints, then passes the access token to the
+        piped subprocess via environment variable.
+        """
+        import tempfile, uuid
+        token_file = os.path.join(tempfile.gettempdir(), f".graph_token_{uuid.uuid4().hex}")
+        script_file = token_file + ".ps1"
+        # Microsoft Graph PowerShell well-known public client ID
+        client_id = "14d82eec-204b-4c2f-b7e8-296a70dab67e"
+        scope = "DeviceManagementApps.ReadWrite.All DeviceManagementConfiguration.ReadWrite.All Group.Read.All offline_access openid profile"
+
+        if use_device_code:
+            ps_script = self._build_device_code_script(tenant_id, client_id, scope, token_file)
+        else:
+            ps_script = self._build_browser_auth_script(tenant_id, client_id, scope, token_file)
+
+        with open(script_file, "w", encoding="utf-8") as f:
+            f.write(ps_script)
+
+        self.log_text.insert("end", "\n=== Pre-authenticating to Microsoft Graph ===\n")
+        if use_device_code:
+            self.log_text.insert("end", "A PowerShell window will open with a device code for sign-in...\n\n")
+        else:
+            self.log_text.insert("end", "A browser window will open for sign-in...\n\n")
+        self.log_text.see("end")
+        self.update_idletasks()
+        self._cached_graph_token = None
+        result = subprocess.run(
+            [POWERSHELL, "-ExecutionPolicy", "Bypass", "-NoProfile", "-File", script_file],
+            cwd=str(WORKSPACE),
+            creationflags=subprocess.CREATE_NEW_CONSOLE,
+        )
+        try:
+            os.unlink(script_file)
+        except OSError:
+            pass
+        if result.returncode != 0:
+            self.log_text.insert("end", "[ERROR] Graph authentication failed. Check the PowerShell window for details.\n")
+            self.log_text.see("end")
+            return False
+        try:
+            with open(token_file, "r", encoding="utf-8") as f:
+                self._cached_graph_token = f.read().strip().lstrip('\ufeff')
+            os.unlink(token_file)
+        except FileNotFoundError:
+            self.log_text.insert("end", "[ERROR] Token file not found. Authentication may have failed.\n")
+            self.log_text.see("end")
+            return False
+        if not self._cached_graph_token:
+            self.log_text.insert("end", "[ERROR] Empty token returned.\n")
+            self.log_text.see("end")
+            return False
+        self.log_text.insert("end", "[OK] Graph authentication successful. Token acquired.\n\n")
+        self.log_text.see("end")
+        return True
+
+    @staticmethod
+    def _build_device_code_script(tenant_id, client_id, scope, token_file):
+        token_file_escaped = token_file.replace("'", "''")
+        return f"""[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+$clientId = '{client_id}'
+$tenantId = '{tenant_id}'
+$scope    = '{scope}'
+$tokenFile = '{token_file_escaped}'
+
+try {{
+    Write-Host 'Requesting device code from Azure AD...' -ForegroundColor Cyan
+    Write-Host ''
+
+    $dcResponse = Invoke-RestMethod -Method POST `
+        -Uri "https://login.microsoftonline.com/$tenantId/oauth2/v2.0/devicecode" `
+        -Body @{{ client_id = $clientId; scope = $scope }} `
+        -ContentType 'application/x-www-form-urlencoded'
+
+    Write-Host $dcResponse.message -ForegroundColor Yellow
+    Write-Host ''
+    try {{ Set-Clipboard -Value $dcResponse.user_code; Write-Host '(Code copied to clipboard)' -ForegroundColor Gray; Write-Host '' }} catch {{ }}
+
+    $interval = [Math]::Max([int]$dcResponse.interval, 5)
+    $expiry   = (Get-Date).AddSeconds([int]$dcResponse.expires_in)
+
+    while ((Get-Date) -lt $expiry) {{
+        Start-Sleep -Seconds $interval
+        try {{
+            $tokenResponse = Invoke-RestMethod -Method POST `
+                -Uri "https://login.microsoftonline.com/$tenantId/oauth2/v2.0/token" `
+                -Body @{{
+                    grant_type  = 'urn:ietf:params:oauth:grant-type:device_code'
+                    client_id   = $clientId
+                    device_code = $dcResponse.device_code
+                }} `
+                -ContentType 'application/x-www-form-urlencoded'
+            break
+        }} catch {{
+            $errBody = $null
+            try {{ $errBody = $_.ErrorDetails.Message | ConvertFrom-Json }} catch {{ }}
+            if ($errBody -and $errBody.error -eq 'authorization_pending') {{ continue }}
+            if ($errBody -and $errBody.error -eq 'slow_down') {{ $interval += 5; continue }}
+            if ($errBody -and $errBody.error -eq 'expired_token') {{ throw 'Device code expired. Please try again.' }}
+            throw
+        }}
+    }}
+
+    if (-not $tokenResponse -or -not $tokenResponse.access_token) {{
+        throw 'Authentication timed out or no token received.'
+    }}
+
+    Write-Host 'Authentication successful!' -ForegroundColor Green
+    [IO.File]::WriteAllText($tokenFile, $tokenResponse.access_token)
+    Start-Sleep -Seconds 2
+    exit 0
+}} catch {{
+    Write-Host "ERROR: $_" -ForegroundColor Red
+    Write-Host ''
+    Read-Host 'Press Enter to close'
+    exit 1
+}}
+"""
+
+    @staticmethod
+    def _build_browser_auth_script(tenant_id, client_id, scope, token_file):
+        token_file_escaped = token_file.replace("'", "''")
+        return f"""[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+$clientId  = '{client_id}'
+$tenantId  = '{tenant_id}'
+$scope     = '{scope}'
+$tokenFile = '{token_file_escaped}'
+
+try {{
+    # Generate PKCE code verifier and challenge
+    $bytes = New-Object byte[] 32
+    $rng = [System.Security.Cryptography.RNGCryptoServiceProvider]::new()
+    $rng.GetBytes($bytes); $rng.Dispose()
+    $codeVerifier = [Convert]::ToBase64String($bytes).TrimEnd('=').Replace('+','-').Replace('/','_')
+
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    $challengeBytes = $sha256.ComputeHash([System.Text.Encoding]::ASCII.GetBytes($codeVerifier))
+    $sha256.Dispose()
+    $codeChallenge = [Convert]::ToBase64String($challengeBytes).TrimEnd('=').Replace('+','-').Replace('/','_')
+
+    # Start localhost HTTP listener
+    $listener = [System.Net.HttpListener]::new()
+    $port = 8400; $started = $false
+    for ($i = 0; $i -lt 10; $i++) {{
+        try {{
+            $listener.Prefixes.Clear()
+            $listener.Prefixes.Add("http://localhost:$port/")
+            $listener.Start(); $started = $true; break
+        }} catch {{ $port++ }}
+    }}
+    if (-not $started) {{ throw 'Could not start HTTP listener on localhost.' }}
+
+    $redirectUri = "http://localhost:$port"
+    $state = [guid]::NewGuid().ToString()
+
+    $authUrl = "https://login.microsoftonline.com/$tenantId/oauth2/v2.0/authorize?" +
+        "client_id=$clientId" +
+        "&response_type=code" +
+        "&redirect_uri=$([Uri]::EscapeDataString($redirectUri))" +
+        "&scope=$([Uri]::EscapeDataString($scope))" +
+        "&state=$state" +
+        "&code_challenge=$codeChallenge" +
+        "&code_challenge_method=S256" +
+        "&prompt=select_account"
+
+    Write-Host 'Opening browser for sign-in...' -ForegroundColor Cyan
+    Write-Host ''
+    Start-Process $authUrl
+
+    # Wait for redirect callback (2 minute timeout)
+    Write-Host 'Waiting for authentication...' -ForegroundColor Gray
+    $async = $listener.BeginGetContext($null, $null)
+    if (-not $async.AsyncWaitHandle.WaitOne(120000)) {{
+        $listener.Stop()
+        throw 'Browser authentication timed out (2 minutes).'
+    }}
+
+    $ctx = $listener.EndGetContext($async)
+
+    # Parse query string
+    $qs = $ctx.Request.Url.Query.TrimStart('?')
+    $params = @{{}}
+    foreach ($pair in $qs.Split('&')) {{
+        $kv = $pair.Split('=', 2)
+        if ($kv.Count -eq 2) {{ $params[$kv[0]] = [Uri]::UnescapeDataString($kv[1]) }}
+    }}
+
+    # Send success page to browser
+    $html = '<html><body style="font-family:sans-serif;text-align:center;padding-top:50px">' +
+            '<h2>Authentication complete!</h2><p>You can close this tab.</p></body></html>'
+    $buf = [System.Text.Encoding]::UTF8.GetBytes($html)
+    $ctx.Response.ContentLength64 = $buf.Length
+    $ctx.Response.ContentType = 'text/html'
+    $ctx.Response.OutputStream.Write($buf, 0, $buf.Length)
+    $ctx.Response.Close(); $listener.Stop()
+
+    if ($params['error']) {{ throw "Auth error: $($params['error_description'])" }}
+    if ($params['state'] -ne $state) {{ throw 'State mismatch - possible CSRF.' }}
+    $code = $params['code']
+    if (-not $code) {{ throw 'No authorization code received.' }}
+
+    Write-Host 'Exchanging code for token...' -ForegroundColor Cyan
+
+    $tokenResponse = Invoke-RestMethod -Method POST `
+        -Uri "https://login.microsoftonline.com/$tenantId/oauth2/v2.0/token" `
+        -Body @{{
+            grant_type    = 'authorization_code'
+            client_id     = $clientId
+            code          = $code
+            redirect_uri  = $redirectUri
+            code_verifier = $codeVerifier
+        }} `
+        -ContentType 'application/x-www-form-urlencoded'
+
+    if (-not $tokenResponse -or -not $tokenResponse.access_token) {{
+        throw 'Token exchange failed - no access token returned.'
+    }}
+
+    Write-Host 'Authentication successful!' -ForegroundColor Green
+    [IO.File]::WriteAllText($tokenFile, $tokenResponse.access_token)
+    Start-Sleep -Seconds 2
+    exit 0
+}} catch {{
+    Write-Host "ERROR: $_" -ForegroundColor Red
+    Write-Host ''
+    Read-Host 'Press Enter to close'
+    exit 1
+}}
+"""
+
+    def _run_command(self, script_name, params, extra_env=None):
         script_path = WORKSPACE / script_name
         if not script_path.exists():
             messagebox.showerror("Missing script", f"Script not found: {script_path}")
@@ -963,19 +1207,19 @@ class IntuneDesktopApp(tk.Tk):
         self.log_text.insert("end", " ".join(f'"{a}"' if " " in a else a for a in args) + "\n\n")
         self.log_text.see("end")
         try:
-            self.runner.run(args, WORKSPACE)
+            self.runner.run(args, WORKSPACE, extra_env=extra_env)
         except RuntimeError as exc:
             messagebox.showwarning("Already running", str(exc))
 
-    def _validate_publish_inputs(self, tenant_id, use_intune_graph_auth, client_id, metadata_path=None):
+    def _validate_publish_inputs(self, tenant_id, use_app_registration, client_id, metadata_path=None):
         if not tenant_id.strip():
             messagebox.showerror("Missing tenant ID", "Tenant ID is required before publish can start.")
             return False
         if metadata_path is not None and not metadata_path.strip():
             messagebox.showerror("Missing metadata", "Select a metadata.json file before publishing.")
             return False
-        if use_intune_graph_auth and not client_id.strip():
-            messagebox.showerror("Missing Intune Client ID", "Intune Client ID is required when IntuneGraph auth is selected.")
+        if use_app_registration and not client_id.strip():
+            messagebox.showerror("Missing Client ID", "Client ID is required when AppRegistration auth is selected.")
             return False
         return True
 
@@ -997,8 +1241,8 @@ class IntuneDesktopApp(tk.Tk):
         self._run_command("New-IntunePackage.ps1", params)
 
     def run_publish(self):
-        use_intune_graph = self.pub_auth_mode.get() == "IntuneGraph"
-        if not self._validate_publish_inputs(self.pub_tenant.get(), use_intune_graph, self.pub_client_id.get(), self.pub_metadata.get()):
+        use_app_registration = self.pub_auth_mode.get() == "AppRegistration"
+        if not self._validate_publish_inputs(self.pub_tenant.get(), use_app_registration, self.pub_client_id.get(), self.pub_metadata.get()):
             return
         params = [
             "-TenantId", self.pub_tenant.get(),
@@ -1007,8 +1251,10 @@ class IntuneDesktopApp(tk.Tk):
         ]
         if self.pub_group.get():
             params += ["-TargetGroupName", self.pub_group.get()]
-        if use_intune_graph:
+        if use_app_registration:
             params += ["-UseIntuneGraphAuth", "-IntuneClientId", self.pub_client_id.get()]
+        else:
+            params += ["-UseDelegatedAuth"]
         if self.pub_module_version.get():
             params += ["-IntuneModuleVersion", self.pub_module_version.get()]
         if self.pub_device_code.get():
@@ -1025,10 +1271,17 @@ class IntuneDesktopApp(tk.Tk):
             params += ["-SupersedeAppId", self.pub_supersede_id.get(), "-SupersedenceType", self.pub_supersedence_type.get()]
         if self.pub_use_azcopy.get():
             params += ["-UseAzCopy"]
-        self._run_command("Publish-IntuneWin32App.ps1", params)
+        extra_env = None
+        if not use_app_registration:
+            if not self._ensure_graph_auth(self.pub_tenant.get(), self.pub_device_code.get()):
+                return
+            if self._cached_graph_token:
+                extra_env = {"GRAPH_ACCESS_TOKEN": self._cached_graph_token}
+        self._run_command("Publish-IntuneWin32App.ps1", params, extra_env=extra_env)
 
     def run_full_flow(self):
-        if not self._validate_publish_inputs(self.run_tenant.get(), True, self.run_client_id.get()):
+        use_app_registration = bool(self.run_client_id.get().strip())
+        if not self._validate_publish_inputs(self.run_tenant.get(), use_app_registration, self.run_client_id.get()):
             return
         params = [
             "-AppName", self.run_app_name.get(),
@@ -1045,7 +1298,10 @@ class IntuneDesktopApp(tk.Tk):
             params += ["-TargetGroupName", self.run_group.get()]
         if self.run_local_installer.get():
             params += ["-LocalInstallerPath", self.run_local_installer.get()]
-        params += ["-UseIntuneGraphAuth", "-IntuneClientId", self.run_client_id.get()]
+        if use_app_registration:
+            params += ["-UseIntuneGraphAuth", "-IntuneClientId", self.run_client_id.get()]
+        else:
+            params += ["-UseDelegatedAuth"]
         if self.run_module_version.get():
             params += ["-IntuneModuleVersion", self.run_module_version.get()]
         if self.run_device_code.get():
@@ -1060,7 +1316,13 @@ class IntuneDesktopApp(tk.Tk):
             params += ["-SupersedeAppId", self.run_supersede_id.get(), "-SupersedenceType", self.run_supersedence_type.get()]
         if self.run_use_azcopy.get():
             params += ["-UseAzCopy"]
-        self._run_command("Invoke-IntuneJob.ps1", params)
+        extra_env = None
+        if not use_app_registration:
+            if not self._ensure_graph_auth(self.run_tenant.get(), self.run_device_code.get()):
+                return
+            if self._cached_graph_token:
+                extra_env = {"GRAPH_ACCESS_TOKEN": self._cached_graph_token}
+        self._run_command("Invoke-IntuneJob.ps1", params, extra_env=extra_env)
 
     def stop_current(self):
         self.runner.terminate()

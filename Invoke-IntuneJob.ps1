@@ -46,6 +46,8 @@ param(
 
     [string]$OverrideConfigPath,
 
+    [switch]$UseDelegatedAuth,
+
     [switch]$UseAzCopy,
 
     [switch]$WhatIf
@@ -80,6 +82,7 @@ if ($UseIntuneGraphAuth) { $publishParams.UseIntuneGraphAuth = $true }
 if ($IntuneClientId) { $publishParams.IntuneClientId = $IntuneClientId }
 if ($IntuneModuleVersion) { $publishParams.IntuneModuleVersion = $IntuneModuleVersion }
 if ($IntuneDeviceCode) { $publishParams.IntuneDeviceCode = $true }
+if ($UseDelegatedAuth) { $publishParams.UseDelegatedAuth = $true }
 if ($OverrideConfigPath) { $publishParams.OverrideConfigPath = $OverrideConfigPath }
 if ($CustomDisplayName) { $publishParams.CustomDisplayName = $CustomDisplayName }
 if ($CustomDescription) { $publishParams.CustomDescription = $CustomDescription }
